@@ -1,0 +1,1 @@
+void scale_task(void *args);
