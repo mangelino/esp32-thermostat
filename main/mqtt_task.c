@@ -41,7 +41,6 @@
 static const char *TAG_MQTT = "MQTTS";
 
 static EventGroupHandle_t *sp_wifi_event_group;
-//static QueueHandle_t * sp_led_queue;
 static esp_mqtt_client_handle_t client;
 
 static message_handler_fptr_t message_handler = NULL;
@@ -66,9 +65,9 @@ void mqtt_register_handler(message_handler_fptr_t handler) {
 
 void mqtt_publish(const char *topic, char* data, int qos) {
     if (client) {
+        ESP_LOGI(TAG_MQTT, "%s %s", topic, data);
         int msg_id = esp_mqtt_client_publish(client, topic, data, 0, qos, 0);
         led_display_pattern("._!");
-        //xQueueSend(*sp_led_queue, "._!", 100);
         ESP_LOGI(TAG_MQTT, "Published with id: %d", msg_id);
     } else {
         ESP_LOGW(TAG_MQTT, "Client not connected");

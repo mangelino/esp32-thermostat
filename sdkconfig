@@ -127,7 +127,7 @@ CONFIG_ESP_WIFI_SSID="Dragonfly"
 CONFIG_ESP_WIFI_PASSWORD="stckhlm2"
 CONFIG_ESP_MAXIMUM_RETRY=5
 CONFIG_ESP_MQTT_BROKER="mqtts://a2iaxhchrg59yw-ats.iot.eu-west-1.amazonaws.com"
-CONFIG_ESP_CLIENT_ID="esp32_bee_monitor"
+CONFIG_ESP_CLIENT_ID="esp32_thermo"
 CONFIG_POLLING_PERIOD_MS=5000
 # end of Bee Monitor Configuration
 

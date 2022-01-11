@@ -14,13 +14,13 @@
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
 #include "driver/gpio.h"
-#include "bme280_task.h"
-#include "scale_task.h"
+#include "thermo_task.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "wifi_task.h"
 #include "mqtt_task.h"
 #include "common.h"
+#include "nvs_flash.h"
 #include "core_json.h"
 #include "led_task.h"
 #include "driver/ledc.h"
@@ -52,35 +52,65 @@ static QueueHandle_t config_queue = NULL;
 /* The polling period for the reporting */
 static int s_period = POLLING_PERIOD_MS;
 
-static void mqtt_message_handler(char *topic, char *data) 
-{
-    ESP_LOGI(TAG, "Got message %s on topic %s", data, topic);
-    
-    char* query = "state.period";
+/* Cound be set via config */
+static int s_min_temp = 2;
+static int s_max_temp = 2;
+
+JSONStatus_t get_shadow_value(char *data, char *query, int *out) {
     char* value;
     size_t valueLength;
     JSONStatus_t result = JSON_Search( data, strlen(data), query, strlen(query),
                               &value, &valueLength );
 
-     if( result == JSONSuccess )
-     {
-         // The pointer "value" will point to a location in the "buffer".
-         char save = value[ valueLength ];
-          // After saving the character, set it to a null byte for printing.
-          value[ valueLength ] = '\0';
-          // "Found: bar.foo -> xyz" will be printed.
-          ESP_LOGI(TAG, "Found: %s -> %s\n", query, value );
-          s_period = atoi(value);
-          // Restore the original character.
-          xQueueSend(config_queue, &s_period, 0);
-          // Report the new period to the shadow
-          char reported[128];
-          char shadow_topic[64];
-          sprintf(shadow_topic, "$aws/things/%s/shadow/name/config/update", CLIENT_ID);
-          sprintf(reported, "{\"state\":{\"reported\":{\"period\":%d}}}", s_period);
-          mqtt_publish(shadow_topic, reported, 1);
-          value[ valueLength ] = save;
-      }
+    if( result == JSONSuccess )
+    {
+        // The pointer "value" will point to a location in the "buffer".
+        char save = value[ valueLength ];
+        // After saving the character, set it to a null byte for printing.
+        value[ valueLength ] = '\0';
+        // "Found: bar.foo -> xyz" will be printed.
+        ESP_LOGI(TAG, "Found: %s -> %s\n", query, value );
+        value[ valueLength ] = save;
+        *out = atoi(value);
+    } else {
+        ESP_LOGI(TAG, "%s not found\n", query);
+    }
+    return result;
+}
+
+static void mqtt_message_handler(char *topic, char *data) 
+{
+    ESP_LOGI(TAG, "Got message %s on topic %s", data, topic);
+    
+    JSONStatus_t result;
+    int out;
+    result = get_shadow_value(data, "state.period", &out);
+    if (result == JSONSuccess) {
+        s_period = out;
+    }
+    result = get_shadow_value(data, "state.min_temp", &out);
+    if (result == JSONSuccess) {
+        s_min_temp = out;
+    }
+    result = get_shadow_value(data, "state.max_temp", &out);
+    if (result == JSONSuccess) {
+        s_max_temp = out;
+    }
+
+    Config_t conf;
+    conf.period = s_period;
+    conf.min_temp = s_min_temp;
+    conf.max_temp = s_max_temp;
+    xQueueSend(config_queue, &conf, 100);
+    char reported[128];
+    char shadow_topic[64];
+    sprintf(shadow_topic, "$aws/things/%s/shadow/name/config/update", CLIENT_ID);
+    sprintf(reported, "{\"state\":{\"reported\":{\"period\":%d, \"min_temp\":%d, \"max_temp\":%d}}}", s_period, s_min_temp, s_max_temp);
+    mqtt_publish(shadow_topic, reported, 1);
+}
+
+int get_sleep_period() {
+    return s_period;
 }
 
 
@@ -108,14 +138,11 @@ static void task_publish(void* arg)
 
 void app_main(void)
 {
-
     ESP_LOGI(TAG, "[APP] Free memory: %d bytes", esp_get_free_heap_size());
-    //gpio_config_t io_conf;
 
     message_queue = xQueueCreate(10, sizeof(char *));
-    config_queue = xQueueCreate(10, sizeof(int));
+    config_queue = xQueueCreate(10, sizeof(Config_t));
     s_reporting_event_group = xEventGroupCreate();
-    // led_queue = xQueueCreate(10, 32);
 
     TaskArgs_t queues = {
         .p_msg_queue = &message_queue,
@@ -124,7 +151,6 @@ void app_main(void)
     };
   
     LedConfig_t led_config = {
-        //.p_led_queue = &led_queue,
         .ch = LEDC_CH0_CHANNEL,
         .pin = LEDC_CH0_GPIO,
         .brightness = LEDC_CH0_BRIGHTNESS,
@@ -137,30 +163,28 @@ void app_main(void)
     mqtt_register_handler(&mqtt_message_handler);
     
     xTaskCreate(task_publish, "task_publish", 2048, &queues, 6, NULL);
-    xTaskCreate(scale_task, "scale_task", 8192, &queues, 6, NULL);
     xTaskCreate(led_task, "led_task", 4096, &led_config, 6, NULL);
     // These are not tasks since they use the Event Loop
     
     start_wifi(&s_wifi_event_group);
     MqttArgs_t mqtt_args = {
         .p_evt_group_handle = &s_wifi_event_group,
-        //.p_led_queue = &led_queue,
     };
     start_mqtt(&mqtt_args);
-    xTaskCreate(task_bme280_normal_mode, "bme280_normal_mode", 4096, &queues, 6, NULL);
+    xTaskCreate(task_thermo, "thermo", 4096, &queues, 6, NULL);
     int cnt = 0;
     
     // Start the main task - should not do anything
     // All the wiring is done in the task
-    //xQueueSend(led_queue, ">>>><<<<", 100);
+
     led_display_pattern(">>>><<<<");
     EventBits_t bits;
     while(1) {
         bits = xEventGroupWaitBits(s_reporting_event_group, 
-          REPORTING_BME280_BIT | REPORTING_SCALE_BIT, pdFALSE, pdTRUE, 1000/portTICK_RATE_MS);
+          REPORTING_THERMO_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(1000));
         char buf[128];
 
-        if (bits & REPORTING_SCALE_BIT && bits & REPORTING_BME280_BIT && xQueuePeek(message_queue, &buf, 100) == pdFALSE) {
+        if ( bits & REPORTING_THERMO_BIT && xQueuePeek(message_queue, &buf, 100) == pdFALSE) {
             ESP_LOGI(TAG, "Ready to sleep");
             mqtt_disconnect();
             stop_wifi();
@@ -168,17 +192,16 @@ void app_main(void)
         }
         ESP_LOGI(TAG, "Got bits %d", bits);
         printf("cnt: %d\n", cnt++);
-        vTaskDelay(1000 / portTICK_RATE_MS);
+        vTaskDelay(pdMS_TO_TICKS(1000));
        
-
-        //gpio_set_level(GPIO_OUTPUT_IO_0, cnt % 2);
-        //gpio_set_level(GPIO_OUTPUT_IO_1, cnt % 2);
     }
     ESP_LOGI(TAG, "Entering deep sleep for %d ms", s_period);
     vEventGroupDelete(s_reporting_event_group);
     vEventGroupDelete(s_wifi_event_group);
     vQueueDelete(message_queue);
     vQueueDelete(config_queue);
-    esp_deep_sleep(s_period*1000);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+    esp_sleep_enable_timer_wakeup(s_period * 1000);
+    esp_deep_sleep_start();
 }
 
